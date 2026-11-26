@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import PortfolioChart from "../components/PortfolioChart";
 import {
   FETCH_TIMEOUT_MS,
@@ -15,7 +15,6 @@ import {
   positionLabel,
   timeAgo,
   tradeIsSettled,
-  tradePayout,
   tradeRealisedPnl,
   uniqueArbTrades,
   venueLabel,
@@ -53,6 +52,102 @@ function categoryOf(item: WatchlistItem): string {
   return "Other";
 }
 
+type PosTab = "open" | "won" | "lost";
+
+/** Outcome badge for one leg. Settlement comes from isLegSettled only. */
+function legOutcome(leg: Leg): { label: string; cls: string } {
+  if (!isLegSettled(leg)) return { label: "OPEN", cls: "badge-open" };
+  return (leg.payout_usd ?? 0) > 0
+    ? { label: "WON", cls: "badge-won" }
+    : { label: "LOST", cls: "badge-lost" };
+}
+
+/**
+ * One row per leg. Payout is shown explicitly as $0.00 for a settled leg
+ * that paid nothing, never as "—", so a loss is unmistakable. The Trade
+ * column shows the parent trade's label and, for settled legs, that
+ * trade's overall realised P&L — a losing leg can belong to a trade
+ * that still made money.
+ */
+function PositionLegTable({
+  rows,
+  settled,
+  emptyText,
+}: {
+  rows: { leg: Leg; trade: Trade }[];
+  settled: boolean;
+  emptyText: string;
+}) {
+  if (rows.length === 0) return <p className="empty">{emptyText}</p>;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Outcome</th>
+            <th>Venue</th>
+            <th>Market</th>
+            <th>Position</th>
+            <th className="num">Entry</th>
+            <th className="num">Contracts</th>
+            <th className="num">Outlay</th>
+            <th className="num">Payout</th>
+            <th className="num">Realised P&amp;L</th>
+            <th>Trade</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({ leg, trade }) => {
+            const outcome = legOutcome(leg);
+            const pnl = settled ? legRealisedPnl(leg) : null;
+            return (
+              <tr
+                key={`${trade.trade_id ?? trade.signal_id ?? trade.timestamp}-${leg.venue}-${leg.market_id ?? leg.proposition}-${leg.side}`}
+              >
+                <td>
+                  <span className={`badge ${outcome.cls}`}>
+                    {outcome.label}
+                  </span>
+                </td>
+                <td>{venueLabel(leg.venue)}</td>
+                <td>{leg.title ?? leg.proposition ?? "—"}</td>
+                <td className="nowrap">{positionLabel(leg)}</td>
+                <td className="num">
+                  {leg.entry_price_cents !== undefined
+                    ? `${leg.entry_price_cents}¢`
+                    : "—"}
+                </td>
+                <td className="num">
+                  {leg.contracts !== undefined
+                    ? Math.round(leg.contracts)
+                    : "—"}
+                </td>
+                <td className="num">{fmtUsd(leg.outlay_usd)}</td>
+                <td className="num">
+                  {settled ? fmtUsd(leg.payout_usd ?? 0) : "—"}
+                </td>
+                <td
+                  className={`num ${pnl === null ? "" : pnl >= 0 ? "txt-pos" : "txt-neg"}`}
+                >
+                  {pnl === null ? "—" : fmtSignedUsd(pnl)}
+                </td>
+                <td>
+                  <div>{trade.label}</div>
+                  {settled && (
+                    <div className="legs">
+                      trade realised {fmtSignedUsd(tradeRealisedPnl(trade))}
+                    </div>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -60,6 +155,9 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [nowTick, setNowTick] = useState(0);
+  // Positions tab the user tapped; null = follow the default (Lost when
+  // everything has settled and there are losers, otherwise Open).
+  const [posTabOverride, setPosTabOverride] = useState<PosTab | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async (isInitial: boolean) => {
@@ -134,17 +232,47 @@ export default function Home() {
   );
   const openLegs = legsWithTrade.filter(({ leg }) => !isLegSettled(leg));
   const settledLegs = legsWithTrade.filter(({ leg }) => isLegSettled(leg));
-  const settledPayout = settledLegs.reduce(
-    (s, { leg }) => s + (leg.payout_usd ?? 0),
-    0,
+  // Won = settled leg that paid out; lost = settled leg that paid $0
+  // (a null payout counts as $0). The losing leg is the half of the arb
+  // that lost even though the trade as a whole made money.
+  const wonLegs = settledLegs.filter(({ leg }) => (leg.payout_usd ?? 0) > 0);
+  const lostLegs = settledLegs.filter(
+    ({ leg }) => (leg.payout_usd ?? 0) === 0,
   );
-  const settledOutlay = settledLegs.reduce(
+  const openOutlay = openLegs.reduce(
     (s, { leg }) => s + (leg.outlay_usd ?? 0),
     0,
   );
-  const settledRealised = settledPayout - settledOutlay;
-  // Settled positions, grouped by trade (newest trade first).
-  const settledTradesList = trades.filter(tradeIsSettled);
+  const wonPayout = wonLegs.reduce(
+    (s, { leg }) => s + (leg.payout_usd ?? 0),
+    0,
+  );
+  const wonRealised = wonLegs.reduce(
+    (s, { leg }) => s + legRealisedPnl(leg),
+    0,
+  );
+  const lostOutlay = lostLegs.reduce(
+    (s, { leg }) => s + (leg.outlay_usd ?? 0),
+    0,
+  );
+  // Combined realised P&L of the trades the losing legs belong to —
+  // deduped by trade, since one trade can hold more than one losing leg.
+  const lostTradeIds = new Set(
+    lostLegs.map(
+      ({ trade }) => trade.trade_id ?? trade.signal_id ?? trade.timestamp,
+    ),
+  );
+  const lostTradesRealised = trades
+    .filter((t) =>
+      lostTradeIds.has(t.trade_id ?? t.signal_id ?? t.timestamp),
+    )
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+  // Default tab: Lost when everything has settled and there are losers
+  // to look at (the user's current state), otherwise Open. Once the user
+  // taps a tab, their choice sticks.
+  const defaultPosTab: PosTab =
+    lostLegs.length > 0 && openLegs.length === 0 ? "lost" : "open";
+  const activePosTab = posTabOverride ?? defaultPosTab;
 
   // The 37 records are 20 unique arbs — 17 were logged twice before the
   // v4.2 dedup fix, so the totals above count the duplicates. Unique
@@ -343,133 +471,83 @@ export default function Home() {
               position in the API, so no current-value column is shown.
             </p>
 
-            <h3 className="subhead">Open positions ({openLegs.length})</h3>
-            {openLegs.length === 0 ? (
-              <p className="empty">
-                No open positions — everything has settled.
-              </p>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Venue</th>
-                      <th>Market</th>
-                      <th>Position</th>
-                      <th className="num">Entry</th>
-                      <th className="num">Contracts</th>
-                      <th className="num">Outlay</th>
-                      <th>Trade</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {openLegs.map(({ leg, trade }) => (
-                      <tr
-                        key={`${trade.trade_id ?? trade.signal_id ?? trade.timestamp}-${leg.venue}-${leg.market_id ?? leg.proposition}`}
-                      >
-                        <td>{venueLabel(leg.venue)}</td>
-                        <td>{leg.title ?? leg.proposition ?? "—"}</td>
-                        <td className="nowrap">{positionLabel(leg)}</td>
-                        <td className="num">
-                          {leg.entry_price_cents !== undefined
-                            ? `${leg.entry_price_cents}¢`
-                            : "—"}
-                        </td>
-                        <td className="num">
-                          {leg.contracts !== undefined
-                            ? Math.round(leg.contracts)
-                            : "—"}
-                        </td>
-                        <td className="num">{fmtUsd(leg.outlay_usd)}</td>
-                        <td>
-                          <div className="legs">{trade.label}</div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            <div
+              className="tabs"
+              role="tablist"
+              aria-label="Positions by outcome"
+            >
+              {(
+                [
+                  ["open", `Open (${openLegs.length})`],
+                  ["won", `Won (${wonLegs.length})`],
+                  ["lost", `Lost (${lostLegs.length})`],
+                ] as const
+              ).map(([tab, label]) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={activePosTab === tab}
+                  className={`tab ${activePosTab === tab ? "tab-active" : ""}`}
+                  onClick={() => setPosTabOverride(tab)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
 
-            <h3 className="subhead">
-              Settled positions — past ({settledLegs.length})
-            </h3>
-            {settledLegs.length === 0 ? (
-              <p className="empty">No settled positions yet.</p>
-            ) : (
+            {activePosTab === "open" && (
               <>
                 <p className="section-note">
-                  Total settled payout {fmtUsd(settledPayout)} · total
-                  settled outlay {fmtUsd(settledOutlay)} · total realised
-                  P&amp;L{" "}
-                  <span
-                    className={`pnl ${settledRealised >= 0 ? "pnl-pos" : "pnl-neg"}`}
-                  >
-                    {fmtSignedUsd(settledRealised)}
-                  </span>
+                  {openLegs.length} open leg{openLegs.length === 1 ? "" : "s"}{" "}
+                  · total outlay {fmtUsd(openOutlay)}.
                 </p>
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Venue</th>
-                        <th>Market</th>
-                        <th>Position</th>
-                        <th className="num">Entry</th>
-                        <th className="num">Contracts</th>
-                        <th className="num">Outlay</th>
-                        <th className="num">Payout</th>
-                        <th className="num">Realised P&amp;L</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {settledTradesList.map((t) => (
-                        <Fragment
-                          key={`g-${t.trade_id ?? t.signal_id ?? t.timestamp}`}
-                        >
-                          <tr className="group-row">
-                            <td colSpan={8}>
-                              {t.label}
-                              <span className="legs">
-                                {" "}
-                                · {fmtTime(t.timestamp)} · outlay{" "}
-                                {fmtUsd(t.outlay_usd)} · payout{" "}
-                                {fmtUsd(tradePayout(t))} · realised{" "}
-                                {fmtSignedUsd(tradeRealisedPnl(t))}
-                              </span>
-                            </td>
-                          </tr>
-                          {(t.legs ?? []).map((leg) => (
-                            <tr
-                              key={`s-${t.trade_id ?? t.signal_id ?? t.timestamp}-${leg.venue}-${leg.market_id ?? leg.proposition}`}
-                            >
-                              <td>{venueLabel(leg.venue)}</td>
-                              <td>{leg.title ?? leg.proposition ?? "—"}</td>
-                              <td className="nowrap">{positionLabel(leg)}</td>
-                              <td className="num">
-                                {leg.entry_price_cents !== undefined
-                                  ? `${leg.entry_price_cents}¢`
-                                  : "—"}
-                              </td>
-                              <td className="num">
-                                {leg.contracts !== undefined
-                                  ? Math.round(leg.contracts)
-                                  : "—"}
-                              </td>
-                              <td className="num">{fmtUsd(leg.outlay_usd)}</td>
-                              <td className="num">{fmtUsd(leg.payout_usd)}</td>
-                              <td
-                                className={`num pnl ${legRealisedPnl(leg) >= 0 ? "pnl-pos" : "pnl-neg"}`}
-                              >
-                                {fmtSignedUsd(legRealisedPnl(leg))}
-                              </td>
-                            </tr>
-                          ))}
-                        </Fragment>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                <PositionLegTable
+                  rows={openLegs}
+                  settled={false}
+                  emptyText="No open positions — everything has settled."
+                />
+              </>
+            )}
+
+            {activePosTab === "won" && (
+              <>
+                <p className="section-note">
+                  {wonLegs.length} winning leg{wonLegs.length === 1 ? "" : "s"}{" "}
+                  · total payout {fmtUsd(wonPayout)} · total realised P&amp;L{" "}
+                  <span className={wonRealised >= 0 ? "txt-pos" : "txt-neg"}>
+                    {fmtSignedUsd(wonRealised)}
+                  </span>
+                  .
+                </p>
+                <PositionLegTable
+                  rows={wonLegs}
+                  settled
+                  emptyText="No winning legs yet."
+                />
+              </>
+            )}
+
+            {activePosTab === "lost" && (
+              <>
+                <p className="section-note">
+                  {lostLegs.length} losing leg{lostLegs.length === 1 ? "" : "s"}{" "}
+                  · total lost {fmtUsd(lostOutlay)} (outlay paid, payout $0.00)
+                  · the trades those legs belong to made{" "}
+                  <span
+                    className={
+                      lostTradesRealised >= 0 ? "txt-pos" : "txt-neg"
+                    }
+                  >
+                    {fmtSignedUsd(lostTradesRealised)}
+                  </span>{" "}
+                  combined.
+                </p>
+                <PositionLegTable
+                  rows={lostLegs}
+                  settled
+                  emptyText="No losing legs — every settled leg paid out."
+                />
               </>
             )}
           </section>

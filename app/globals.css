@@ -509,6 +509,54 @@ tbody tr:last-child td {
   padding: 8px 0;
 }
 
+/* ---------- position tabs ---------- */
+.tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 4px;
+}
+
+.tab {
+  font: inherit;
+  font-size: 1rem;
+  font-weight: 700;
+  padding: 12px 20px;
+  min-height: 48px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.tab-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.badge-won {
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.badge-lost {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+/* Strong P&L colours for white cards (pnl-pos/pnl-neg are for the dark card). */
+.txt-pos {
+  color: var(--green);
+  font-weight: 700;
+}
+
+.txt-neg {
+  color: var(--red);
+  font-weight: 700;
+}
+
 /* ---------- watchlist ---------- */
 .watchlist {
   display: grid;
