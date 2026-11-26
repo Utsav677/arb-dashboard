@@ -437,15 +437,17 @@ function TradesTable({
 }
 
 /**
- * Portfolio cards. The pool is shared between the two runs — the values
- * are the same on both tabs; only the trade counts reflect this tab.
+ * Portfolio cards. v4.5: each run has its OWN bankroll — the cards
+ * show the active tab's pool (`label` names it), never a shared pool.
  */
 function PortfolioCards({
   portfolio,
   trades,
+  label,
 }: {
   portfolio: Portfolio;
   trades: Trade[];
+  label: string;
 }) {
   const starting = portfolio.starting_value ?? STARTING_DEFAULT;
   const pnl = portfolio.pnl ?? portfolio.total_value - starting;
@@ -455,7 +457,7 @@ function PortfolioCards({
   return (
     <section className="cards">
       <div className="card card-total">
-        <div className="card-label">Total portfolio value</div>
+        <div className="card-label">{label}</div>
         <div className="card-big">{fmtUsd(portfolio.total_value)}</div>
         <div className={`pnl ${pnl >= 0 ? "pnl-pos" : "pnl-neg"}`}>
           P&amp;L vs {fmtUsd(starting)}: {fmtSignedUsd(pnl)} (
@@ -591,7 +593,15 @@ export default function Home() {
   for (const item of watchlist) groups[categoryOf(item)].push(item);
 
   const portfolio = data?.portfolio;
+  // v4.5: each run has its OWN bankroll. The arb tab shows the arb
+  // pool ($10,168.03 live); the model tab shows the model pool (fresh
+  // $10,000). They never share cash.
+  const modelPortfolio = data?.model_portfolio;
+  const activePortfolio = topTab === "arb" ? portfolio : modelPortfolio;
   const seriesPoints = data?.series?.portfolio_value ?? [];
+  const modelSeriesPoints = data?.series?.model_portfolio_value ?? [];
+  const activeSeriesPoints =
+    topTab === "arb" ? seriesPoints : modelSeriesPoints;
   const apiUrl = getApiUrl();
 
   // The counts on the portfolio cards reflect the active tab's trades.
@@ -603,8 +613,9 @@ export default function Home() {
         <div>
           <h1>Paper Trader</h1>
           <p className="subtitle">
-            Two paper runs, one cash pool — Kalshi vs Polymarket arbitrage,
-            and a self-learning betting model. Fake money. Read-only.
+            Two separate paper runs — Kalshi vs Polymarket arbitrage, and
+            a self-learning betting model. Each has its own bankroll.
+            Fake money. Read-only.
           </p>
         </div>
         <div className="header-right">
@@ -686,16 +697,31 @@ export default function Home() {
             ))}
           </div>
           <p className="section-note">
-            One shared cash pool — the arbitrage bot and the betting model
-            bet from the same $10,000. The portfolio cards below are the
-            shared pool; the trade counts on them are for this tab.
+            Two separate paper bankrolls — the arbitrage bot and the
+            betting model never share cash. Arbitrage started at $10,000
+            (now $10,168.03); the model started fresh at $10,000.
           </p>
 
-          {portfolio && <PortfolioCards portfolio={portfolio} trades={activeTrades} />}
+          {activePortfolio ? (
+            <PortfolioCards
+              portfolio={activePortfolio}
+              trades={activeTrades}
+              label={
+                topTab === "arb" ? "Arbitrage bankroll" : "Model bankroll"
+              }
+            />
+          ) : (
+            <section className="card">
+              <p className="empty">
+                The model bankroll appears here once the v4.5 dashboard is
+                deployed — the model started with its own fresh $10,000.
+              </p>
+            </section>
+          )}
 
           <section className="card chart-card">
             <h2>Portfolio value over time</h2>
-            <PortfolioChart points={seriesPoints} startingValue={portfolio?.starting_value ?? STARTING_DEFAULT} />
+            <PortfolioChart points={activeSeriesPoints} startingValue={activePortfolio?.starting_value ?? STARTING_DEFAULT} />
           </section>
 
           {topTab === "arb" && (

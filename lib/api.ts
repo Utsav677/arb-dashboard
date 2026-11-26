@@ -99,12 +99,17 @@ export interface SeriesPoint {
 
 export interface DashboardData {
   portfolio: Portfolio;
+  /** v4.5: the betting model's OWN bankroll, separate from the arb
+      pool. Absent when the deployed dashboard predates v4.5. */
+  model_portfolio?: Portfolio;
   trades: Trade[];
   signals: Signal[];
   best_signal: Signal | null;
   watchlist: WatchlistItem[];
   series: {
     portfolio_value: SeriesPoint[];
+    /** v4.5: model pool's portfolio-value series. */
+    model_portfolio_value?: SeriesPoint[];
     best_edge?: { ts: string; edge_c: number }[];
     candidates?: { ts: string; count: number }[];
   };
