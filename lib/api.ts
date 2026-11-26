@@ -50,6 +50,8 @@ export interface Trade {
   timestamp: string;
   label: string;
   status: string;
+  /** "arb" (cross-venue arbitrage) or "model" (self-learning betting model). */
+  source?: string;
   cost_cents: number;
   contracts: number;
   outlay_usd: number;

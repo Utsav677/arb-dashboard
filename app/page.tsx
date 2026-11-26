@@ -20,6 +20,7 @@ import {
   venueLabel,
   type DashboardData,
   type Leg,
+  type Portfolio,
   type Trade,
   type WatchlistItem,
 } from "../lib/api";
@@ -148,6 +149,357 @@ function PositionLegTable({
   );
 }
 
+/**
+ * Positions for one run (arb or model trades), with its own Open/Won/Lost
+ * tabs. Won = settled leg that paid out; lost = settled leg that paid $0
+ * (a null payout counts as $0).
+ */
+function PositionsSection({ trades }: { trades: Trade[] }) {
+  // Tab the user tapped; null = follow the default (Lost when everything
+  // has settled and there are losers, otherwise Open).
+  const [posTabOverride, setPosTabOverride] = useState<PosTab | null>(null);
+
+  // Positions are derived from the trades' legs, not from the portfolio's
+  // open_positions counts (those are integers, not position rows).
+  const legsWithTrade = trades.flatMap((t) =>
+    (t.legs ?? []).map((leg) => ({ leg, trade: t })),
+  );
+  const openLegs = legsWithTrade.filter(({ leg }) => !isLegSettled(leg));
+  const settledLegs = legsWithTrade.filter(({ leg }) => isLegSettled(leg));
+  const wonLegs = settledLegs.filter(({ leg }) => (leg.payout_usd ?? 0) > 0);
+  const lostLegs = settledLegs.filter(
+    ({ leg }) => (leg.payout_usd ?? 0) === 0,
+  );
+  const openOutlay = openLegs.reduce(
+    (s, { leg }) => s + (leg.outlay_usd ?? 0),
+    0,
+  );
+  const wonPayout = wonLegs.reduce(
+    (s, { leg }) => s + (leg.payout_usd ?? 0),
+    0,
+  );
+  const wonRealised = wonLegs.reduce(
+    (s, { leg }) => s + legRealisedPnl(leg),
+    0,
+  );
+  const lostOutlay = lostLegs.reduce(
+    (s, { leg }) => s + (leg.outlay_usd ?? 0),
+    0,
+  );
+  // Combined realised P&L of the trades the losing legs belong to —
+  // deduped by trade, since one trade can hold more than one losing leg.
+  const lostTradeIds = new Set(
+    lostLegs.map(
+      ({ trade }) => trade.trade_id ?? trade.signal_id ?? trade.timestamp,
+    ),
+  );
+  const lostTradesRealised = trades
+    .filter((t) =>
+      lostTradeIds.has(t.trade_id ?? t.signal_id ?? t.timestamp),
+    )
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+  const defaultPosTab: PosTab =
+    lostLegs.length > 0 && openLegs.length === 0 ? "lost" : "open";
+  const activePosTab = posTabOverride ?? defaultPosTab;
+
+  return (
+    <section className="card">
+      <h2>
+        Positions ({openLegs.length} open · {settledLegs.length} settled)
+      </h2>
+      <p className="section-note">
+        One row per position (one leg of a trade) on each venue,
+        Kalshi-style. Status comes from the position itself — the
+        trade-level status in the log still says &ldquo;open&rdquo; even
+        after a trade settles. There is no live mark-to-market price per
+        position in the API, so no current-value column is shown.
+      </p>
+
+      <div
+        className="tabs"
+        role="tablist"
+        aria-label="Positions by outcome"
+      >
+        {(
+          [
+            ["open", `Open (${openLegs.length})`],
+            ["won", `Won (${wonLegs.length})`],
+            ["lost", `Lost (${lostLegs.length})`],
+          ] as const
+        ).map(([tab, label]) => (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            aria-selected={activePosTab === tab}
+            className={`tab ${activePosTab === tab ? "tab-active" : ""}`}
+            onClick={() => setPosTabOverride(tab)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {activePosTab === "open" && (
+        <>
+          <p className="section-note">
+            {openLegs.length} open leg{openLegs.length === 1 ? "" : "s"}{" "}
+            · total outlay {fmtUsd(openOutlay)}.
+          </p>
+          <PositionLegTable
+            rows={openLegs}
+            settled={false}
+            emptyText="No open positions — everything has settled."
+          />
+        </>
+      )}
+
+      {activePosTab === "won" && (
+        <>
+          <p className="section-note">
+            {wonLegs.length} winning leg{wonLegs.length === 1 ? "" : "s"}{" "}
+            · total payout {fmtUsd(wonPayout)} · total realised P&amp;L{" "}
+            <span className={wonRealised >= 0 ? "txt-pos" : "txt-neg"}>
+              {fmtSignedUsd(wonRealised)}
+            </span>
+            .
+          </p>
+          <PositionLegTable
+            rows={wonLegs}
+            settled
+            emptyText="No winning legs yet."
+          />
+        </>
+      )}
+
+      {activePosTab === "lost" && (
+        <>
+          <p className="section-note">
+            {lostLegs.length} losing leg{lostLegs.length === 1 ? "" : "s"}{" "}
+            · total lost {fmtUsd(lostOutlay)} (outlay paid, payout $0.00)
+            · the trades those legs belong to made{" "}
+            <span
+              className={
+                lostTradesRealised >= 0 ? "txt-pos" : "txt-neg"
+              }
+            >
+              {fmtSignedUsd(lostTradesRealised)}
+            </span>{" "}
+            combined.
+          </p>
+          <PositionLegTable
+            rows={lostLegs}
+            settled
+            emptyText="No losing legs — every settled leg paid out."
+          />
+        </>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Trades table for one run. Trade status is derived from its legs
+ * (settled when every leg is settled), not from the log's status field.
+ * The dedup note is arb-only: the pre-v4.2 double-trading bug logged
+ * some arbs twice.
+ */
+function TradesTable({
+  trades,
+  showDedupNote,
+  note,
+}: {
+  trades: Trade[];
+  showDedupNote: boolean;
+  note?: string;
+}) {
+  // Trade status is derived from the legs — the trade-level `status` field
+  // keeps its entry-time value and still says "open" for settled trades.
+  const openTrades = trades.filter((t) => !tradeIsSettled(t)).length;
+  const settledTrades = trades.length - openTrades;
+  const totalLocked = trades.reduce(
+    (s, t) => s + (t.locked_in_profit_usd ?? 0),
+    0,
+  );
+  const totalOutlay = trades.reduce((s, t) => s + (t.outlay_usd ?? 0), 0);
+  const totalRealised = trades
+    .filter(tradeIsSettled)
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+
+  // The 37 records are 20 unique arbs — 17 were logged twice before the
+  // v4.2 dedup fix, so the totals above count the duplicates. Unique
+  // totals are the honest per-arb figures.
+  const uniqueTrades = uniqueArbTrades(trades);
+  const uniqueLocked = uniqueTrades.reduce(
+    (s, t) => s + (t.locked_in_profit_usd ?? 0),
+    0,
+  );
+  const uniqueRealised = uniqueTrades
+    .filter(tradeIsSettled)
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+
+  return (
+    <section className="card">
+      <h2>
+        Trades ({trades.length})
+        {openTrades > 0 && settledTrades === 0 && (
+          <span className="h2-note">
+            All open — none have settled yet
+          </span>
+        )}
+      </h2>
+      <p className="section-note">
+        Total outlay {fmtUsd(totalOutlay)}
+        {showDedupNote && (
+          <>
+            {" "}· locked-in profit if all settle as expected{" "}
+            {fmtUsd(totalLocked)}
+          </>
+        )}{" "}
+        · realised P&amp;L so far {fmtSignedUsd(totalRealised)}. Trade
+        status is derived from its legs (settled when every leg is
+        settled), not from the log&apos;s status field.
+        {showDedupNote && (
+          <>
+            {" "}The {trades.length} records are {uniqueTrades.length}{" "}
+            unique arbs — 17 were logged twice before the v4.2 dedup fix —
+            so the totals count the duplicates; counted once each, locked
+            profit is {fmtUsd(uniqueLocked)} and realised P&amp;L is{" "}
+            {fmtSignedUsd(uniqueRealised)}.
+          </>
+        )}
+        {note ? ` ${note}` : ""}
+      </p>
+      {trades.length === 0 ? (
+        <p className="empty">No trades yet.</p>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Trade</th>
+                <th className="num">Cost</th>
+                <th className="num">Contracts</th>
+                <th className="num">Outlay</th>
+                <th className="num">Fees</th>
+                <th className="num">Net edge</th>
+                <th className="num">Locked profit</th>
+                <th className="num">Realised P&amp;L</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trades.map((t) => {
+                const settled = tradeIsSettled(t);
+                return (
+                  <tr key={t.trade_id ?? t.signal_id ?? t.timestamp}>
+                    <td className="nowrap">{fmtTime(t.timestamp)}</td>
+                    <td>
+                      <div>{t.label}</div>
+                      <div className="legs">{legsSummary(t.legs)}</div>
+                    </td>
+                    <td className="num">{fmtCents(t.cost_cents)}</td>
+                    <td className="num">
+                      {t.contracts !== undefined
+                        ? Math.round(t.contracts)
+                        : "—"}
+                    </td>
+                    <td className="num">{fmtUsd(t.outlay_usd)}</td>
+                    <td className="num">{fmtUsd(t.fees_usd)}</td>
+                    <td className="num">{fmtCents(t.net_edge_cents)}</td>
+                    <td className="num">
+                      {fmtSignedUsd(t.locked_in_profit_usd)}
+                    </td>
+                    <td
+                      className={`num pnl ${settled && tradeRealisedPnl(t) >= 0 ? "pnl-pos" : settled ? "pnl-neg" : ""}`}
+                    >
+                      {settled ? fmtSignedUsd(tradeRealisedPnl(t)) : "—"}
+                    </td>
+                    <td>
+                      <span
+                        className={`badge ${
+                          settled ? "badge-settled" : "badge-open"
+                        }`}
+                      >
+                        {settled ? "settled" : "open"}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Portfolio cards. The pool is shared between the two runs — the values
+ * are the same on both tabs; only the trade counts reflect this tab.
+ */
+function PortfolioCards({
+  portfolio,
+  trades,
+}: {
+  portfolio: Portfolio;
+  trades: Trade[];
+}) {
+  const starting = portfolio.starting_value ?? STARTING_DEFAULT;
+  const pnl = portfolio.pnl ?? portfolio.total_value - starting;
+  const pnlPct = starting ? (pnl / starting) * 100 : 0;
+  const openTrades = trades.filter((t) => !tradeIsSettled(t)).length;
+  const settledTrades = trades.length - openTrades;
+  return (
+    <section className="cards">
+      <div className="card card-total">
+        <div className="card-label">Total portfolio value</div>
+        <div className="card-big">{fmtUsd(portfolio.total_value)}</div>
+        <div className={`pnl ${pnl >= 0 ? "pnl-pos" : "pnl-neg"}`}>
+          P&amp;L vs {fmtUsd(starting)}: {fmtSignedUsd(pnl)} (
+          {pnlPct >= 0 ? "+" : ""}
+          {pnlPct.toFixed(2)}%)
+        </div>
+        <div className="card-sub">
+          {trades.length} trades · {openTrades} open · {settledTrades}{" "}
+          settled
+          {portfolio.kill_switch_active ? " · KILL SWITCH ACTIVE" : ""}
+        </div>
+      </div>
+
+      {(
+        [
+          ["Kalshi", portfolio.kalshi],
+          ["Polymarket", portfolio.polymarket],
+        ] as const
+      ).map(([name, v]) => (
+        <div className="card" key={name}>
+          <div className="card-label">{name}</div>
+          <div className="card-big">{fmtUsd(v.value)}</div>
+          <dl className="venue-rows">
+            <div>
+              <dt>Cash</dt>
+              <dd>{fmtUsd(v.cash)}</dd>
+            </div>
+            <div>
+              <dt>Open positions</dt>
+              <dd>{fmtUsd(v.positions_value)}</dd>
+            </div>
+            <div>
+              <dt>Positions</dt>
+              <dd>{v.open_positions}</dd>
+            </div>
+          </dl>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+type TopTab = "arb" | "model";
+
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -155,9 +507,7 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [nowTick, setNowTick] = useState(0);
-  // Positions tab the user tapped; null = follow the default (Lost when
-  // everything has settled and there are losers, otherwise Open).
-  const [posTabOverride, setPosTabOverride] = useState<PosTab | null>(null);
+  const [topTab, setTopTab] = useState<TopTab>("arb");
   const abortRef = useRef<AbortController | null>(null);
 
   const load = useCallback(async (isInitial: boolean) => {
@@ -212,99 +562,49 @@ export default function Home() {
   const signals = [...(data?.signals ?? [])]
     .sort((a, b) => b.net_edge_cents - a.net_edge_cents)
     .slice(0, 20);
-  // Trade status is derived from the legs — the trade-level `status` field
-  // keeps its entry-time value and still says "open" for settled trades.
-  const openTrades = trades.filter((t) => !tradeIsSettled(t)).length;
-  const settledTrades = trades.length - openTrades;
-  const totalLocked = trades.reduce(
-    (s, t) => s + (t.locked_in_profit_usd ?? 0),
+  // The two runs, split by the trade's `source` field. Pre-model trades
+  // carry no source field and are arb trades.
+  const arbTrades = trades.filter((t) => (t.source ?? "arb") === "arb");
+  const modelTrades = trades.filter((t) => t.source === "model");
+
+  // Model summary, from model trades only.
+  const modelLegs = modelTrades.flatMap((t) => t.legs ?? []);
+  const modelSettledLegs = modelLegs.filter(isLegSettled);
+  const modelWonLegs = modelSettledLegs.filter(
+    (leg) => (leg.payout_usd ?? 0) > 0,
+  );
+  const modelOpenLegs = modelLegs.filter((leg) => !isLegSettled(leg));
+  const modelOutlay = modelTrades.reduce(
+    (s, t) => s + (t.outlay_usd ?? 0),
     0,
   );
-  const totalOutlay = trades.reduce((s, t) => s + (t.outlay_usd ?? 0), 0);
-  const totalRealised = trades
+  const modelRealised = modelTrades
     .filter(tradeIsSettled)
     .reduce((s, t) => s + tradeRealisedPnl(t), 0);
-
-  // Positions are derived from the trades' legs, not from the portfolio's
-  // open_positions counts (those are integers, not position rows).
-  const legsWithTrade = trades.flatMap((t) =>
-    (t.legs ?? []).map((leg) => ({ leg, trade: t })),
-  );
-  const openLegs = legsWithTrade.filter(({ leg }) => !isLegSettled(leg));
-  const settledLegs = legsWithTrade.filter(({ leg }) => isLegSettled(leg));
-  // Won = settled leg that paid out; lost = settled leg that paid $0
-  // (a null payout counts as $0). The losing leg is the half of the arb
-  // that lost even though the trade as a whole made money.
-  const wonLegs = settledLegs.filter(({ leg }) => (leg.payout_usd ?? 0) > 0);
-  const lostLegs = settledLegs.filter(
-    ({ leg }) => (leg.payout_usd ?? 0) === 0,
-  );
-  const openOutlay = openLegs.reduce(
-    (s, { leg }) => s + (leg.outlay_usd ?? 0),
-    0,
-  );
-  const wonPayout = wonLegs.reduce(
-    (s, { leg }) => s + (leg.payout_usd ?? 0),
-    0,
-  );
-  const wonRealised = wonLegs.reduce(
-    (s, { leg }) => s + legRealisedPnl(leg),
-    0,
-  );
-  const lostOutlay = lostLegs.reduce(
-    (s, { leg }) => s + (leg.outlay_usd ?? 0),
-    0,
-  );
-  // Combined realised P&L of the trades the losing legs belong to —
-  // deduped by trade, since one trade can hold more than one losing leg.
-  const lostTradeIds = new Set(
-    lostLegs.map(
-      ({ trade }) => trade.trade_id ?? trade.signal_id ?? trade.timestamp,
-    ),
-  );
-  const lostTradesRealised = trades
-    .filter((t) =>
-      lostTradeIds.has(t.trade_id ?? t.signal_id ?? t.timestamp),
-    )
-    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
-  // Default tab: Lost when everything has settled and there are losers
-  // to look at (the user's current state), otherwise Open. Once the user
-  // taps a tab, their choice sticks.
-  const defaultPosTab: PosTab =
-    lostLegs.length > 0 && openLegs.length === 0 ? "lost" : "open";
-  const activePosTab = posTabOverride ?? defaultPosTab;
-
-  // The 37 records are 20 unique arbs — 17 were logged twice before the
-  // v4.2 dedup fix, so the totals above count the duplicates. Unique
-  // totals are the honest per-arb figures.
-  const uniqueTrades = uniqueArbTrades(trades);
-  const uniqueLocked = uniqueTrades.reduce(
-    (s, t) => s + (t.locked_in_profit_usd ?? 0),
-    0,
-  );
-  const uniqueRealised = uniqueTrades
-    .filter(tradeIsSettled)
-    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+  const modelWinRate =
+    modelSettledLegs.length > 0
+      ? (modelWonLegs.length / modelSettledLegs.length) * 100
+      : null;
 
   const watchlist = data?.watchlist ?? [];
   const groups: Record<string, WatchlistItem[]> = { Chess: [], NBA: [], NFL: [], Other: [] };
   for (const item of watchlist) groups[categoryOf(item)].push(item);
 
   const portfolio = data?.portfolio;
-  const starting = portfolio?.starting_value ?? STARTING_DEFAULT;
-  const pnl = portfolio?.pnl ?? (portfolio ? portfolio.total_value - starting : 0);
-  const pnlPct = starting ? (pnl / starting) * 100 : 0;
   const seriesPoints = data?.series?.portfolio_value ?? [];
   const apiUrl = getApiUrl();
+
+  // The counts on the portfolio cards reflect the active tab's trades.
+  const activeTrades = topTab === "arb" ? arbTrades : modelTrades;
 
   return (
     <main className="page">
       <header className="header">
         <div>
-          <h1>Arb Paper Trader</h1>
+          <h1>Paper Trader</h1>
           <p className="subtitle">
-            Kalshi vs Polymarket cross-venue arbitrage — paper trading, fake
-            money. Read-only.
+            Two paper runs, one cash pool — Kalshi vs Polymarket arbitrage,
+            and a self-learning betting model. Fake money. Read-only.
           </p>
         </div>
         <div className="header-right">
@@ -366,357 +666,240 @@ export default function Home() {
             </span>
           </section>
 
-          {portfolio && (
-            <section className="cards">
-              <div className="card card-total">
-                <div className="card-label">Total portfolio value</div>
-                <div className="card-big">{fmtUsd(portfolio.total_value)}</div>
-                <div
-                  className={`pnl ${pnl >= 0 ? "pnl-pos" : "pnl-neg"}`}
-                >
-                  P&amp;L vs {fmtUsd(starting)}: {fmtSignedUsd(pnl)} (
-                  {pnlPct >= 0 ? "+" : ""}
-                  {pnlPct.toFixed(2)}%)
-                </div>
-                <div className="card-sub">
-                  {trades.length} trades · {openTrades} open ·{" "}
-                  {settledTrades} settled
-                  {portfolio.kill_switch_active ? " · KILL SWITCH ACTIVE" : ""}
-                </div>
-              </div>
+          <div className="top-tabs" role="tablist" aria-label="Run">
+            {(
+              [
+                ["arb", `Arbitrage (${arbTrades.length})`],
+                ["model", `Betting Model (${modelTrades.length})`],
+              ] as const
+            ).map(([tab, label]) => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                aria-selected={topTab === tab}
+                className={`top-tab ${topTab === tab ? "top-tab-active" : ""}`}
+                onClick={() => setTopTab(tab)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <p className="section-note">
+            One shared cash pool — the arbitrage bot and the betting model
+            bet from the same $10,000. The portfolio cards below are the
+            shared pool; the trade counts on them are for this tab.
+          </p>
 
-              {(
-                [
-                  ["Kalshi", portfolio.kalshi],
-                  ["Polymarket", portfolio.polymarket],
-                ] as const
-              ).map(([name, v]) => (
-                <div className="card" key={name}>
-                  <div className="card-label">{name}</div>
-                  <div className="card-big">{fmtUsd(v.value)}</div>
-                  <dl className="venue-rows">
-                    <div>
-                      <dt>Cash</dt>
-                      <dd>{fmtUsd(v.cash)}</dd>
-                    </div>
-                    <div>
-                      <dt>Open positions</dt>
-                      <dd>{fmtUsd(v.positions_value)}</dd>
-                    </div>
-                    <div>
-                      <dt>Positions</dt>
-                      <dd>{v.open_positions}</dd>
-                    </div>
-                  </dl>
-                </div>
-              ))}
-            </section>
-          )}
+          {portfolio && <PortfolioCards portfolio={portfolio} trades={activeTrades} />}
 
           <section className="card chart-card">
             <h2>Portfolio value over time</h2>
-            <PortfolioChart points={seriesPoints} startingValue={starting} />
+            <PortfolioChart points={seriesPoints} startingValue={portfolio?.starting_value ?? STARTING_DEFAULT} />
           </section>
 
-          {data?.best_signal && (
-            <section className="card best-signal">
-              <h2>Best signal right now</h2>
-              <div className="best-label">{data.best_signal.label}</div>
-              <div className="best-grid">
-                <div>
-                  <span className="kv-label">Net edge</span>
-                  <span className="kv-value">
-                    {fmtCents(data.best_signal.net_edge_cents)}
-                  </span>
-                </div>
-                <div>
-                  <span className="kv-label">Cost</span>
-                  <span className="kv-value">
-                    {fmtCents(data.best_signal.cost_cents)}
-                  </span>
-                </div>
-                <div>
-                  <span className="kv-label">Min depth</span>
-                  <span className="kv-value">
-                    {data.best_signal.depth_min_usd !== undefined
-                      ? fmtUsd(data.best_signal.depth_min_usd)
-                      : "—"}
-                  </span>
-                </div>
-                <div>
-                  <span className="kv-label">Tradeable</span>
-                  <span className="kv-value">
-                    {data.best_signal.tradeable ? "Yes" : "No"}
-                    {data.best_signal.reason
-                      ? ` — ${data.best_signal.reason}`
-                      : ""}
-                  </span>
-                </div>
-              </div>
-              {data.best_signal.event_name && (
-                <div className="card-sub">{data.best_signal.event_name}</div>
+          {topTab === "arb" && (
+            <>
+              {data?.best_signal && (
+                <section className="card best-signal">
+                  <h2>Best signal right now</h2>
+                  <div className="best-label">{data.best_signal.label}</div>
+                  <div className="best-grid">
+                    <div>
+                      <span className="kv-label">Net edge</span>
+                      <span className="kv-value">
+                        {fmtCents(data.best_signal.net_edge_cents)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Cost</span>
+                      <span className="kv-value">
+                        {fmtCents(data.best_signal.cost_cents)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Min depth</span>
+                      <span className="kv-value">
+                        {data.best_signal.depth_min_usd !== undefined
+                          ? fmtUsd(data.best_signal.depth_min_usd)
+                          : "—"}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Tradeable</span>
+                      <span className="kv-value">
+                        {data.best_signal.tradeable ? "Yes" : "No"}
+                        {data.best_signal.reason
+                          ? ` — ${data.best_signal.reason}`
+                          : ""}
+                      </span>
+                    </div>
+                  </div>
+                  {data.best_signal.event_name && (
+                    <div className="card-sub">{data.best_signal.event_name}</div>
+                  )}
+                </section>
               )}
-            </section>
+
+              <PositionsSection trades={arbTrades} />
+
+              <TradesTable trades={arbTrades} showDedupNote />
+
+              <section className="card">
+                <h2>Top signals by net edge</h2>
+                {signals.length === 0 ? (
+                  <p className="empty">No signals right now.</p>
+                ) : (
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Signal</th>
+                          <th className="num">Net edge</th>
+                          <th className="num">Cost</th>
+                          <th className="num">Min depth</th>
+                          <th>Tradeable</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {signals.map((s) => (
+                          <tr key={s.id}>
+                            <td>
+                              <div>{s.label}</div>
+                              <div className="legs">{legsSummary(s.legs)}</div>
+                            </td>
+                            <td className="num">{fmtCents(s.net_edge_cents)}</td>
+                            <td className="num">{fmtCents(s.cost_cents)}</td>
+                            <td className="num">
+                              {s.depth_min_usd !== undefined
+                                ? fmtUsd(s.depth_min_usd)
+                                : "—"}
+                            </td>
+                            <td>
+                              {s.tradeable ? (
+                                <span className="badge badge-settled">yes</span>
+                              ) : (
+                                <span className="badge badge-open">
+                                  no{s.reason ? ` — ${s.reason}` : ""}
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
+
+              <section className="card">
+                <h2>Watchlist ({watchlist.length} events)</h2>
+                <div className="watchlist">
+                  {(["Chess", "NBA", "NFL", "Other"] as const).map((cat) => (
+                    <div key={cat} className="watch-group">
+                      <h3>
+                        {cat} ({groups[cat].length})
+                      </h3>
+                      {groups[cat].length === 0 ? (
+                        <p className="empty">None.</p>
+                      ) : (
+                        <ul>
+                          {groups[cat].map((item) => (
+                            <li key={item.key}>
+                              <span>{item.name}</span>
+                              {item.venues && (
+                                <span className="legs">
+                                  {" "}
+                                  · {item.venues.join(" + ")}
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </>
           )}
 
-          <section className="card">
-            <h2>
-              Positions ({openLegs.length} open · {settledLegs.length} settled)
-            </h2>
-            <p className="section-note">
-              One row per position (one leg of a trade) on each venue,
-              Kalshi-style. Status comes from the position itself — the
-              trade-level status in the log still says &ldquo;open&rdquo; even
-              after a trade settles. There is no live mark-to-market price per
-              position in the API, so no current-value column is shown.
-            </p>
-
-            <div
-              className="tabs"
-              role="tablist"
-              aria-label="Positions by outcome"
-            >
-              {(
-                [
-                  ["open", `Open (${openLegs.length})`],
-                  ["won", `Won (${wonLegs.length})`],
-                  ["lost", `Lost (${lostLegs.length})`],
-                ] as const
-              ).map(([tab, label]) => (
-                <button
-                  key={tab}
-                  type="button"
-                  role="tab"
-                  aria-selected={activePosTab === tab}
-                  className={`tab ${activePosTab === tab ? "tab-active" : ""}`}
-                  onClick={() => setPosTabOverride(tab)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {activePosTab === "open" && (
-              <>
+          {topTab === "model" && (
+            <>
+              <section className="card">
+                <h2>Betting Model</h2>
                 <p className="section-note">
-                  {openLegs.length} open leg{openLegs.length === 1 ? "" : "s"}{" "}
-                  · total outlay {fmtUsd(openOutlay)}.
+                  The self-learning model bets on Kalshi when its own
+                  probability is well above the payout-implied probability
+                  (edge ≥ 3¢ for singles, ≥ 5¢ for combos), sizes with
+                  quarter-Kelly capped at 2% of bankroll, and records every
+                  bet in its outcomes database — it learns from correct and
+                  wrong outcomes. The kill switch stops it if realised model
+                  P&amp;L falls below −2% of bankroll.
                 </p>
-                <PositionLegTable
-                  rows={openLegs}
-                  settled={false}
-                  emptyText="No open positions — everything has settled."
-                />
-              </>
-            )}
-
-            {activePosTab === "won" && (
-              <>
                 <p className="section-note">
-                  {wonLegs.length} winning leg{wonLegs.length === 1 ? "" : "s"}{" "}
-                  · total payout {fmtUsd(wonPayout)} · total realised P&amp;L{" "}
-                  <span className={wonRealised >= 0 ? "txt-pos" : "txt-neg"}>
-                    {fmtSignedUsd(wonRealised)}
-                  </span>
-                  .
+                  Note: model bets are player props, which resolve in the
+                  model&apos;s outcomes database — legs here show as settled
+                  only once the API marks them settled.
                 </p>
-                <PositionLegTable
-                  rows={wonLegs}
-                  settled
-                  emptyText="No winning legs yet."
-                />
-              </>
-            )}
+                {modelTrades.length === 0 ? (
+                  <p className="empty">
+                    No model bets yet — the model only bets when its edge is
+                    ≥ 3¢ (singles) / ≥ 5¢ (combos). It is live and checking
+                    every minute.
+                  </p>
+                ) : (
+                  <div className="best-grid">
+                    <div>
+                      <span className="kv-label">Model bets placed</span>
+                      <span className="kv-value">{modelTrades.length}</span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Total outlay</span>
+                      <span className="kv-value">{fmtUsd(modelOutlay)}</span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Realised P&amp;L</span>
+                      <span
+                        className={`kv-value ${modelRealised >= 0 ? "txt-pos" : "txt-neg"}`}
+                      >
+                        {fmtSignedUsd(modelRealised)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Win rate (settled legs)</span>
+                      <span className="kv-value">
+                        {modelWinRate === null
+                          ? "—"
+                          : `${modelWonLegs.length}/${modelSettledLegs.length} (${modelWinRate.toFixed(0)}%)`}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="kv-label">Open positions</span>
+                      <span className="kv-value">{modelOpenLegs.length}</span>
+                    </div>
+                  </div>
+                )}
+              </section>
 
-            {activePosTab === "lost" && (
-              <>
-                <p className="section-note">
-                  {lostLegs.length} losing leg{lostLegs.length === 1 ? "" : "s"}{" "}
-                  · total lost {fmtUsd(lostOutlay)} (outlay paid, payout $0.00)
-                  · the trades those legs belong to made{" "}
-                  <span
-                    className={
-                      lostTradesRealised >= 0 ? "txt-pos" : "txt-neg"
-                    }
-                  >
-                    {fmtSignedUsd(lostTradesRealised)}
-                  </span>{" "}
-                  combined.
-                </p>
-                <PositionLegTable
-                  rows={lostLegs}
-                  settled
-                  emptyText="No losing legs — every settled leg paid out."
-                />
-              </>
-            )}
-          </section>
-
-          <section className="card">
-            <h2>
-              Trades ({trades.length})
-              {openTrades > 0 && settledTrades === 0 && (
-                <span className="h2-note">
-                  All open — none have settled yet
-                </span>
+              {modelTrades.length > 0 && (
+                <>
+                  <PositionsSection trades={modelTrades} />
+                  <TradesTable
+                    trades={modelTrades}
+                    showDedupNote={false}
+                    note="A model bet wins when the event it bet on happens; a losing leg is the outlay on a leg that paid $0."
+                  />
+                </>
               )}
-            </h2>
-            <p className="section-note">
-              Total outlay {fmtUsd(totalOutlay)} · locked-in profit if all
-              settle as expected {fmtUsd(totalLocked)} · realised P&amp;L so
-              far {fmtSignedUsd(totalRealised)}. Trade status is derived from
-              its legs (settled when every leg is settled), not from the
-              log&apos;s status field. The {trades.length} records are{" "}
-              {uniqueTrades.length} unique arbs — 17 were logged twice before
-              the v4.2 dedup fix — so the totals count the duplicates; counted
-              once each, locked profit is {fmtUsd(uniqueLocked)} and realised
-              P&amp;L is {fmtSignedUsd(uniqueRealised)}.
-            </p>
-            {trades.length === 0 ? (
-              <p className="empty">No trades yet.</p>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Trade</th>
-                      <th className="num">Cost</th>
-                      <th className="num">Contracts</th>
-                      <th className="num">Outlay</th>
-                      <th className="num">Fees</th>
-                      <th className="num">Net edge</th>
-                      <th className="num">Locked profit</th>
-                      <th className="num">Realised P&amp;L</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {trades.map((t) => {
-                      const settled = tradeIsSettled(t);
-                      return (
-                        <tr key={t.trade_id ?? t.signal_id ?? t.timestamp}>
-                          <td className="nowrap">{fmtTime(t.timestamp)}</td>
-                          <td>
-                            <div>{t.label}</div>
-                            <div className="legs">{legsSummary(t.legs)}</div>
-                          </td>
-                          <td className="num">{fmtCents(t.cost_cents)}</td>
-                          <td className="num">
-                            {t.contracts !== undefined
-                              ? Math.round(t.contracts)
-                              : "—"}
-                          </td>
-                          <td className="num">{fmtUsd(t.outlay_usd)}</td>
-                          <td className="num">{fmtUsd(t.fees_usd)}</td>
-                          <td className="num">{fmtCents(t.net_edge_cents)}</td>
-                          <td className="num">
-                            {fmtSignedUsd(t.locked_in_profit_usd)}
-                          </td>
-                          <td
-                            className={`num pnl ${settled && tradeRealisedPnl(t) >= 0 ? "pnl-pos" : settled ? "pnl-neg" : ""}`}
-                          >
-                            {settled ? fmtSignedUsd(tradeRealisedPnl(t)) : "—"}
-                          </td>
-                          <td>
-                            <span
-                              className={`badge ${
-                                settled ? "badge-settled" : "badge-open"
-                              }`}
-                            >
-                              {settled ? "settled" : "open"}
-                            </span>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          <section className="card">
-            <h2>Top signals by net edge</h2>
-            {signals.length === 0 ? (
-              <p className="empty">No signals right now.</p>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Signal</th>
-                      <th className="num">Net edge</th>
-                      <th className="num">Cost</th>
-                      <th className="num">Min depth</th>
-                      <th>Tradeable</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {signals.map((s) => (
-                      <tr key={s.id}>
-                        <td>
-                          <div>{s.label}</div>
-                          <div className="legs">{legsSummary(s.legs)}</div>
-                        </td>
-                        <td className="num">{fmtCents(s.net_edge_cents)}</td>
-                        <td className="num">{fmtCents(s.cost_cents)}</td>
-                        <td className="num">
-                          {s.depth_min_usd !== undefined
-                            ? fmtUsd(s.depth_min_usd)
-                            : "—"}
-                        </td>
-                        <td>
-                          {s.tradeable ? (
-                            <span className="badge badge-settled">yes</span>
-                          ) : (
-                            <span className="badge badge-open">
-                              no{s.reason ? ` — ${s.reason}` : ""}
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          <section className="card">
-            <h2>Watchlist ({watchlist.length} events)</h2>
-            <div className="watchlist">
-              {(["Chess", "NBA", "NFL", "Other"] as const).map((cat) => (
-                <div key={cat} className="watch-group">
-                  <h3>
-                    {cat} ({groups[cat].length})
-                  </h3>
-                  {groups[cat].length === 0 ? (
-                    <p className="empty">None.</p>
-                  ) : (
-                    <ul>
-                      {groups[cat].map((item) => (
-                        <li key={item.key}>
-                          <span>{item.name}</span>
-                          {item.venues && (
-                            <span className="legs">
-                              {" "}
-                              · {item.venues.join(" + ")}
-                            </span>
-                          )}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              ))}
-            </div>
-          </section>
+            </>
+          )}
 
           <footer className="footer">
             <span>
-              Read-only dashboard for the arb paper trader (fake money, 2-week
-              run). It never places trades.
+              Read-only dashboard for the paper trader (fake money, 2-week
+              run). It never places trades. Two runs share one cash pool:
+              cross-venue arbitrage and the self-learning betting model.
             </span>
             <span>
               API: <code>{apiUrl}</code>
