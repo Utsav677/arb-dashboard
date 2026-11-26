@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import PortfolioChart from "../components/PortfolioChart";
 import {
   FETCH_TIMEOUT_MS,
@@ -10,7 +10,15 @@ import {
   fmtTime,
   fmtUsd,
   getApiUrl,
+  isLegSettled,
+  legRealisedPnl,
+  positionLabel,
   timeAgo,
+  tradeIsSettled,
+  tradePayout,
+  tradeRealisedPnl,
+  uniqueArbTrades,
+  venueLabel,
   type DashboardData,
   type Leg,
   type Trade,
@@ -106,13 +114,49 @@ export default function Home() {
   const signals = [...(data?.signals ?? [])]
     .sort((a, b) => b.net_edge_cents - a.net_edge_cents)
     .slice(0, 20);
-  const openTrades = trades.filter((t) => t.status === "open").length;
+  // Trade status is derived from the legs — the trade-level `status` field
+  // keeps its entry-time value and still says "open" for settled trades.
+  const openTrades = trades.filter((t) => !tradeIsSettled(t)).length;
   const settledTrades = trades.length - openTrades;
   const totalLocked = trades.reduce(
     (s, t) => s + (t.locked_in_profit_usd ?? 0),
     0,
   );
   const totalOutlay = trades.reduce((s, t) => s + (t.outlay_usd ?? 0), 0);
+  const totalRealised = trades
+    .filter(tradeIsSettled)
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+
+  // Positions are derived from the trades' legs, not from the portfolio's
+  // open_positions counts (those are integers, not position rows).
+  const legsWithTrade = trades.flatMap((t) =>
+    (t.legs ?? []).map((leg) => ({ leg, trade: t })),
+  );
+  const openLegs = legsWithTrade.filter(({ leg }) => !isLegSettled(leg));
+  const settledLegs = legsWithTrade.filter(({ leg }) => isLegSettled(leg));
+  const settledPayout = settledLegs.reduce(
+    (s, { leg }) => s + (leg.payout_usd ?? 0),
+    0,
+  );
+  const settledOutlay = settledLegs.reduce(
+    (s, { leg }) => s + (leg.outlay_usd ?? 0),
+    0,
+  );
+  const settledRealised = settledPayout - settledOutlay;
+  // Settled positions, grouped by trade (newest trade first).
+  const settledTradesList = trades.filter(tradeIsSettled);
+
+  // The 37 records are 20 unique arbs — 17 were logged twice before the
+  // v4.2 dedup fix, so the totals above count the duplicates. Unique
+  // totals are the honest per-arb figures.
+  const uniqueTrades = uniqueArbTrades(trades);
+  const uniqueLocked = uniqueTrades.reduce(
+    (s, t) => s + (t.locked_in_profit_usd ?? 0),
+    0,
+  );
+  const uniqueRealised = uniqueTrades
+    .filter(tradeIsSettled)
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
 
   const watchlist = data?.watchlist ?? [];
   const groups: Record<string, WatchlistItem[]> = { Chess: [], NBA: [], NFL: [], Other: [] };
@@ -289,6 +333,149 @@ export default function Home() {
 
           <section className="card">
             <h2>
+              Positions ({openLegs.length} open · {settledLegs.length} settled)
+            </h2>
+            <p className="section-note">
+              One row per position (one leg of a trade) on each venue,
+              Kalshi-style. Status comes from the position itself — the
+              trade-level status in the log still says &ldquo;open&rdquo; even
+              after a trade settles. There is no live mark-to-market price per
+              position in the API, so no current-value column is shown.
+            </p>
+
+            <h3 className="subhead">Open positions ({openLegs.length})</h3>
+            {openLegs.length === 0 ? (
+              <p className="empty">
+                No open positions — everything has settled.
+              </p>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Venue</th>
+                      <th>Market</th>
+                      <th>Position</th>
+                      <th className="num">Entry</th>
+                      <th className="num">Contracts</th>
+                      <th className="num">Outlay</th>
+                      <th>Trade</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {openLegs.map(({ leg, trade }) => (
+                      <tr
+                        key={`${trade.trade_id ?? trade.signal_id ?? trade.timestamp}-${leg.venue}-${leg.market_id ?? leg.proposition}`}
+                      >
+                        <td>{venueLabel(leg.venue)}</td>
+                        <td>{leg.title ?? leg.proposition ?? "—"}</td>
+                        <td className="nowrap">{positionLabel(leg)}</td>
+                        <td className="num">
+                          {leg.entry_price_cents !== undefined
+                            ? `${leg.entry_price_cents}¢`
+                            : "—"}
+                        </td>
+                        <td className="num">
+                          {leg.contracts !== undefined
+                            ? Math.round(leg.contracts)
+                            : "—"}
+                        </td>
+                        <td className="num">{fmtUsd(leg.outlay_usd)}</td>
+                        <td>
+                          <div className="legs">{trade.label}</div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <h3 className="subhead">
+              Settled positions — past ({settledLegs.length})
+            </h3>
+            {settledLegs.length === 0 ? (
+              <p className="empty">No settled positions yet.</p>
+            ) : (
+              <>
+                <p className="section-note">
+                  Total settled payout {fmtUsd(settledPayout)} · total
+                  settled outlay {fmtUsd(settledOutlay)} · total realised
+                  P&amp;L{" "}
+                  <span
+                    className={`pnl ${settledRealised >= 0 ? "pnl-pos" : "pnl-neg"}`}
+                  >
+                    {fmtSignedUsd(settledRealised)}
+                  </span>
+                </p>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Venue</th>
+                        <th>Market</th>
+                        <th>Position</th>
+                        <th className="num">Entry</th>
+                        <th className="num">Contracts</th>
+                        <th className="num">Outlay</th>
+                        <th className="num">Payout</th>
+                        <th className="num">Realised P&amp;L</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {settledTradesList.map((t) => (
+                        <Fragment
+                          key={`g-${t.trade_id ?? t.signal_id ?? t.timestamp}`}
+                        >
+                          <tr className="group-row">
+                            <td colSpan={8}>
+                              {t.label}
+                              <span className="legs">
+                                {" "}
+                                · {fmtTime(t.timestamp)} · outlay{" "}
+                                {fmtUsd(t.outlay_usd)} · payout{" "}
+                                {fmtUsd(tradePayout(t))} · realised{" "}
+                                {fmtSignedUsd(tradeRealisedPnl(t))}
+                              </span>
+                            </td>
+                          </tr>
+                          {(t.legs ?? []).map((leg) => (
+                            <tr
+                              key={`s-${t.trade_id ?? t.signal_id ?? t.timestamp}-${leg.venue}-${leg.market_id ?? leg.proposition}`}
+                            >
+                              <td>{venueLabel(leg.venue)}</td>
+                              <td>{leg.title ?? leg.proposition ?? "—"}</td>
+                              <td className="nowrap">{positionLabel(leg)}</td>
+                              <td className="num">
+                                {leg.entry_price_cents !== undefined
+                                  ? `${leg.entry_price_cents}¢`
+                                  : "—"}
+                              </td>
+                              <td className="num">
+                                {leg.contracts !== undefined
+                                  ? Math.round(leg.contracts)
+                                  : "—"}
+                              </td>
+                              <td className="num">{fmtUsd(leg.outlay_usd)}</td>
+                              <td className="num">{fmtUsd(leg.payout_usd)}</td>
+                              <td
+                                className={`num pnl ${legRealisedPnl(leg) >= 0 ? "pnl-pos" : "pnl-neg"}`}
+                              >
+                                {fmtSignedUsd(legRealisedPnl(leg))}
+                              </td>
+                            </tr>
+                          ))}
+                        </Fragment>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </section>
+
+          <section className="card">
+            <h2>
               Trades ({trades.length})
               {openTrades > 0 && settledTrades === 0 && (
                 <span className="h2-note">
@@ -298,8 +485,14 @@ export default function Home() {
             </h2>
             <p className="section-note">
               Total outlay {fmtUsd(totalOutlay)} · locked-in profit if all
-              settle as expected {fmtUsd(totalLocked)}. Locked-in profit only
-              becomes real when the events settle.
+              settle as expected {fmtUsd(totalLocked)} · realised P&amp;L so
+              far {fmtSignedUsd(totalRealised)}. Trade status is derived from
+              its legs (settled when every leg is settled), not from the
+              log&apos;s status field. The {trades.length} records are{" "}
+              {uniqueTrades.length} unique arbs — 17 were logged twice before
+              the v4.2 dedup fix — so the totals count the duplicates; counted
+              once each, locked profit is {fmtUsd(uniqueLocked)} and realised
+              P&amp;L is {fmtSignedUsd(uniqueRealised)}.
             </p>
             {trades.length === 0 ? (
               <p className="empty">No trades yet.</p>
@@ -316,40 +509,49 @@ export default function Home() {
                       <th className="num">Fees</th>
                       <th className="num">Net edge</th>
                       <th className="num">Locked profit</th>
+                      <th className="num">Realised P&amp;L</th>
                       <th>Status</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {trades.map((t) => (
-                      <tr key={t.trade_id ?? t.signal_id ?? t.timestamp}>
-                        <td className="nowrap">{fmtTime(t.timestamp)}</td>
-                        <td>
-                          <div>{t.label}</div>
-                          <div className="legs">{legsSummary(t.legs)}</div>
-                        </td>
-                        <td className="num">{fmtCents(t.cost_cents)}</td>
-                        <td className="num">
-                          {t.contracts !== undefined
-                            ? Math.round(t.contracts)
-                            : "—"}
-                        </td>
-                        <td className="num">{fmtUsd(t.outlay_usd)}</td>
-                        <td className="num">{fmtUsd(t.fees_usd)}</td>
-                        <td className="num">{fmtCents(t.net_edge_cents)}</td>
-                        <td className="num">
-                          {fmtSignedUsd(t.locked_in_profit_usd)}
-                        </td>
-                        <td>
-                          <span
-                            className={`badge ${
-                              t.status === "open" ? "badge-open" : "badge-settled"
-                            }`}
+                    {trades.map((t) => {
+                      const settled = tradeIsSettled(t);
+                      return (
+                        <tr key={t.trade_id ?? t.signal_id ?? t.timestamp}>
+                          <td className="nowrap">{fmtTime(t.timestamp)}</td>
+                          <td>
+                            <div>{t.label}</div>
+                            <div className="legs">{legsSummary(t.legs)}</div>
+                          </td>
+                          <td className="num">{fmtCents(t.cost_cents)}</td>
+                          <td className="num">
+                            {t.contracts !== undefined
+                              ? Math.round(t.contracts)
+                              : "—"}
+                          </td>
+                          <td className="num">{fmtUsd(t.outlay_usd)}</td>
+                          <td className="num">{fmtUsd(t.fees_usd)}</td>
+                          <td className="num">{fmtCents(t.net_edge_cents)}</td>
+                          <td className="num">
+                            {fmtSignedUsd(t.locked_in_profit_usd)}
+                          </td>
+                          <td
+                            className={`num pnl ${settled && tradeRealisedPnl(t) >= 0 ? "pnl-pos" : settled ? "pnl-neg" : ""}`}
                           >
-                            {t.status}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
+                            {settled ? fmtSignedUsd(tradeRealisedPnl(t)) : "—"}
+                          </td>
+                          <td>
+                            <span
+                              className={`badge ${
+                                settled ? "badge-settled" : "badge-open"
+                              }`}
+                            >
+                              {settled ? "settled" : "open"}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

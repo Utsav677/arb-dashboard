@@ -420,6 +420,22 @@ body {
   margin-bottom: 12px;
 }
 
+.subhead {
+  font-size: 0.95rem;
+  margin: 16px 0 8px;
+}
+
+.subhead:first-of-type {
+  margin-top: 4px;
+}
+
+tr.group-row td {
+  background: var(--surface-muted);
+  font-weight: 600;
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+
 .table-wrap {
   overflow-x: auto;
   margin: 0 -20px;

@@ -117,6 +117,73 @@ export interface DashboardData {
 /** The API is slow (~8-13s) because it re-derives the slate on every call. */
 export const FETCH_TIMEOUT_MS = 45000;
 
+/** ---------- positions / settlement helpers ---------- */
+
+/** A leg is settled only when the API says so; missing status counts as open. */
+export function isLegSettled(leg: Leg | undefined): boolean {
+  return leg?.status === "settled";
+}
+
+/**
+ * The trade-level `status` field is unreliable — the log keeps the
+ * entry-time status, so settled trades still say "open". Derive a trade's
+ * settled state from its legs: settled only when it has legs and all of
+ * them are settled.
+ */
+export function tradeIsSettled(trade: Trade): boolean {
+  const legs = trade.legs ?? [];
+  return legs.length > 0 && legs.every(isLegSettled);
+}
+
+/** Sum of this trade's leg payouts (null payout counts as 0). */
+export function tradePayout(trade: Trade): number {
+  return (trade.legs ?? []).reduce(
+    (s, l) => s + (l.payout_usd ?? 0),
+    0,
+  );
+}
+
+/** Realised P&L for a trade = sum of leg payouts − outlay. */
+export function tradeRealisedPnl(trade: Trade): number {
+  return tradePayout(trade) - (trade.outlay_usd ?? 0);
+}
+
+/** Realised P&L for a single leg = payout − outlay. */
+export function legRealisedPnl(leg: Leg): number {
+  return (leg.payout_usd ?? 0) - (leg.outlay_usd ?? 0);
+}
+
+export function venueLabel(venue: string | undefined): string {
+  return venue === "kalshi" ? "Kalshi" : venue === "polymarket" ? "Poly" : (venue ?? "—");
+}
+
+/** e.g. "Trail Blazers YES". */
+export function positionLabel(leg: Leg): string {
+  const prop = leg.proposition ?? leg.title ?? "";
+  const side = (leg.side ?? "").toUpperCase();
+  return side ? `${prop} ${side}` : prop;
+}
+
+/**
+ * Group trades into unique arbs. The pre-v4.2 double-trading bug logged the
+ * same arb twice — once as a Kalshi YES and once as the equivalent Kalshi
+ * NO — while the Polymarket leg and the net edge are identical in both
+ * records. So the Poly leg + net edge identifies one unique arb.
+ * Returns one representative trade per unique arb.
+ */
+export function uniqueArbTrades(trades: Trade[]): Trade[] {
+  const seen = new Map<string, Trade>();
+  for (const t of trades) {
+    const poly = (t.legs ?? []).find((l) => l.venue === "polymarket");
+    const key = poly
+      ? `poly:${poly.market_id ?? ""}:${poly.side ?? ""}:${poly.proposition ?? ""}:${poly.entry_price_cents ?? ""}:${t.net_edge_cents ?? ""}`
+      : `trade:${t.trade_id ?? t.signal_id ?? t.timestamp}`;
+    if (!seen.has(key)) seen.set(key, t);
+  }
+  return [...seen.values()];
+}
+
+
 export async function fetchDashboard(
   signal: AbortSignal,
 ): Promise<DashboardData> {
