@@ -21,6 +21,7 @@ import {
   type DashboardData,
   type Leg,
   type Portfolio,
+  type TimingLearning,
   type Trade,
   type WatchlistItem,
 } from "../lib/api";
@@ -500,7 +501,156 @@ function PortfolioCards({
   );
 }
 
-type TopTab = "arb" | "model";
+/**
+ * Stats grid for one BTC run (trend or timing), computed from that
+ * run's trades only. Shared by both BTC tabs.
+ */
+function RunStats({ trades }: { trades: Trade[] }) {
+  const legs = trades.flatMap((t) => t.legs ?? []);
+  const settledLegs = legs.filter(isLegSettled);
+  const wonLegs = settledLegs.filter((leg) => (leg.payout_usd ?? 0) > 0);
+  const openLegs = legs.filter((leg) => !isLegSettled(leg));
+  const outlay = trades.reduce((s, t) => s + (t.outlay_usd ?? 0), 0);
+  const realised = trades
+    .filter(tradeIsSettled)
+    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
+  const winRate =
+    settledLegs.length > 0
+      ? (wonLegs.length / settledLegs.length) * 100
+      : null;
+  return (
+    <div className="best-grid">
+      <div>
+        <span className="kv-label">Bets placed</span>
+        <span className="kv-value">{trades.length}</span>
+      </div>
+      <div>
+        <span className="kv-label">Total outlay</span>
+        <span className="kv-value">{fmtUsd(outlay)}</span>
+      </div>
+      <div>
+        <span className="kv-label">Realised P&amp;L</span>
+        <span
+          className={`kv-value ${realised >= 0 ? "txt-pos" : "txt-neg"}`}
+        >
+          {fmtSignedUsd(realised)}
+        </span>
+      </div>
+      <div>
+        <span className="kv-label">Win rate (settled legs)</span>
+        <span className="kv-value">
+          {winRate === null
+            ? "—"
+            : `${wonLegs.length}/${settledLegs.length} (${winRate.toFixed(0)}%)`}
+        </span>
+      </div>
+      <div>
+        <span className="kv-label">Open positions</span>
+        <span className="kv-value">{openLegs.length}</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "What I've learned" — the timing model's per-entry-minute record.
+ * The best minute (highest predicted payout from the model's linear
+ * regression) is highlighted. When nothing has been bet yet, the model
+ * is still learning and there is nothing to show.
+ */
+function TimingLearningSection({
+  learning,
+}: {
+  learning: TimingLearning | undefined;
+}) {
+  const minutes = [...(learning?.minutes ?? [])].sort(
+    (a, b) => a.entry_minute - b.entry_minute,
+  );
+  const totalBets = minutes.reduce((s, m) => s + (m.bets ?? 0), 0);
+  const bestMinute = learning?.best_minute ?? null;
+
+  return (
+    <section className="card">
+      <h2>What I&apos;ve learned</h2>
+      <p className="section-note">
+        The timing model tries different entry minutes in the 15-minute
+        window and records what each one pays. It fits a linear regression
+        over those records — expected payout as a function of entry minute
+        — and bets mostly at the best minute so far, while still trying
+        other minutes about 20% of the time so it keeps learning. It
+        doesn&apos;t have to win every bet; it has to find the minute
+        that pays best over time.
+      </p>
+      {totalBets === 0 ? (
+        <p className="empty">
+          No bets yet — the model is still learning.
+        </p>
+      ) : (
+        <>
+          {bestMinute !== null && (
+            <p className="section-note">
+              Best minute so far:{" "}
+              <strong>minute {bestMinute}</strong> — the model bets there
+              most often and explores other minutes the rest of the time.
+            </p>
+          )}
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Entry minute</th>
+                  <th className="num">Bets</th>
+                  <th className="num">Wins</th>
+                  <th className="num">Win rate</th>
+                  <th className="num">Avg P&amp;L / bet</th>
+                  <th className="num">Total P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {minutes.map((m) => {
+                  const isBest =
+                    bestMinute !== null && m.entry_minute === bestMinute;
+                  return (
+                    <tr
+                      key={m.entry_minute}
+                      className={isBest ? "row-best" : undefined}
+                    >
+                      <td>
+                        Minute {m.entry_minute}
+                        {isBest && (
+                          <span className="badge badge-settled"> best</span>
+                        )}
+                      </td>
+                      <td className="num">{m.bets}</td>
+                      <td className="num">{m.wins}</td>
+                      <td className="num">
+                        {m.bets > 0
+                          ? `${(((m.win_rate ?? 0) > 1 ? (m.win_rate ?? 0) : (m.win_rate ?? 0) * 100)).toFixed(0)}%`
+                          : "—"}
+                      </td>
+                      <td
+                        className={`num ${(m.avg_pnl ?? 0) >= 0 ? "txt-pos" : "txt-neg"}`}
+                      >
+                        {m.bets > 0 ? fmtSignedUsd(m.avg_pnl) : "—"}
+                      </td>
+                      <td
+                        className={`num ${(m.total_pnl ?? 0) >= 0 ? "txt-pos" : "txt-neg"}`}
+                      >
+                        {m.bets > 0 ? fmtSignedUsd(m.total_pnl) : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+type TopTab = "arb" | "btc_trend" | "btc_timing";
 
 export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
@@ -564,48 +714,53 @@ export default function Home() {
   const signals = [...(data?.signals ?? [])]
     .sort((a, b) => b.net_edge_cents - a.net_edge_cents)
     .slice(0, 20);
-  // The two runs, split by the trade's `source` field. Pre-model trades
+  // The three runs, split by the trade's `source` field. Pre-BTC trades
   // carry no source field and are arb trades.
   const arbTrades = trades.filter((t) => (t.source ?? "arb") === "arb");
-  const modelTrades = trades.filter((t) => t.source === "model");
-
-  // Model summary, from model trades only.
-  const modelLegs = modelTrades.flatMap((t) => t.legs ?? []);
-  const modelSettledLegs = modelLegs.filter(isLegSettled);
-  const modelWonLegs = modelSettledLegs.filter(
-    (leg) => (leg.payout_usd ?? 0) > 0,
-  );
-  const modelOpenLegs = modelLegs.filter((leg) => !isLegSettled(leg));
-  const modelOutlay = modelTrades.reduce(
-    (s, t) => s + (t.outlay_usd ?? 0),
-    0,
-  );
-  const modelRealised = modelTrades
-    .filter(tradeIsSettled)
-    .reduce((s, t) => s + tradeRealisedPnl(t), 0);
-  const modelWinRate =
-    modelSettledLegs.length > 0
-      ? (modelWonLegs.length / modelSettledLegs.length) * 100
-      : null;
+  const btcTrendTrades = trades.filter((t) => t.source === "btc_trend");
+  const btcTimingTrades = trades.filter((t) => t.source === "btc_timing");
 
   const watchlist = data?.watchlist ?? [];
   const groups: Record<string, WatchlistItem[]> = { Chess: [], NBA: [], NFL: [], Other: [] };
   for (const item of watchlist) groups[categoryOf(item)].push(item);
 
   const portfolio = data?.portfolio;
-  // v4.5: each run has its OWN bankroll. The arb tab shows the arb
-  // pool ($10,168.03 live); the model tab shows the model pool (fresh
-  // $10,000). They never share cash.
-  const modelPortfolio = data?.model_portfolio;
-  const activePortfolio = topTab === "arb" ? portfolio : modelPortfolio;
+  // Each run has its OWN bankroll and never shares cash: the arb pool,
+  // the BTC Trend pool (fresh $1,000) and the BTC Timing pool (fresh
+  // $1,000). The new pools are absent until the backend deploys them.
+  const btcTrendPortfolio = data?.btc_trend_portfolio;
+  const btcTimingPortfolio = data?.btc_timing_portfolio;
+  const activePortfolio =
+    topTab === "arb"
+      ? portfolio
+      : topTab === "btc_trend"
+        ? btcTrendPortfolio
+        : btcTimingPortfolio;
   const seriesPoints = data?.series?.portfolio_value ?? [];
-  const modelSeriesPoints = data?.series?.model_portfolio_value ?? [];
+  const btcTrendSeriesPoints = data?.series?.btc_trend_portfolio_value ?? [];
+  const btcTimingSeriesPoints =
+    data?.series?.btc_timing_portfolio_value ?? [];
   const activeSeriesPoints =
-    topTab === "arb" ? seriesPoints : modelSeriesPoints;
+    topTab === "arb"
+      ? seriesPoints
+      : topTab === "btc_trend"
+        ? btcTrendSeriesPoints
+        : btcTimingSeriesPoints;
   const apiUrl = getApiUrl();
 
   // The counts on the portfolio cards reflect the active tab's trades.
-  const activeTrades = topTab === "arb" ? arbTrades : modelTrades;
+  const activeTrades =
+    topTab === "arb"
+      ? arbTrades
+      : topTab === "btc_trend"
+        ? btcTrendTrades
+        : btcTimingTrades;
+  const activeLabel =
+    topTab === "arb"
+      ? "Arbitrage bankroll"
+      : topTab === "btc_trend"
+        ? "BTC Trend bankroll"
+        : "BTC Timing bankroll";
 
   return (
     <main className="page">
@@ -613,8 +768,9 @@ export default function Home() {
         <div>
           <h1>Paper Trader</h1>
           <p className="subtitle">
-            Two separate paper runs — Kalshi vs Polymarket arbitrage, and
-            a self-learning betting model. Each has its own bankroll.
+            Three separate paper runs — Kalshi vs Polymarket arbitrage, a
+            fixed 12-minute Bitcoin trend bet, and a timing model that
+            learns the best minute to bet. Each has its own bankroll.
             Fake money. Read-only.
           </p>
         </div>
@@ -681,7 +837,8 @@ export default function Home() {
             {(
               [
                 ["arb", `Arbitrage (${arbTrades.length})`],
-                ["model", `Betting Model (${modelTrades.length})`],
+                ["btc_trend", `BTC Trend (${btcTrendTrades.length})`],
+                ["btc_timing", `BTC Timing (${btcTimingTrades.length})`],
               ] as const
             ).map(([tab, label]) => (
               <button
@@ -697,24 +854,23 @@ export default function Home() {
             ))}
           </div>
           <p className="section-note">
-            Two separate paper bankrolls — the arbitrage bot and the
-            betting model never share cash. Arbitrage started at $10,000
-            (now $10,168.03); the model started fresh at $10,000.
+            Three separate paper bankrolls — arbitrage, BTC Trend and BTC
+            Timing never share cash. Arbitrage started at $10,000; BTC
+            Trend and BTC Timing each started fresh at $1,000.
           </p>
 
           {activePortfolio ? (
             <PortfolioCards
               portfolio={activePortfolio}
               trades={activeTrades}
-              label={
-                topTab === "arb" ? "Arbitrage bankroll" : "Model bankroll"
-              }
+              label={activeLabel}
             />
           ) : (
             <section className="card">
               <p className="empty">
-                The model bankroll appears here once the v4.5 dashboard is
-                deployed — the model started with its own fresh $10,000.
+                This run&apos;s bankroll appears here once the backend
+                deploys it — the BTC runs each started with their own
+                fresh $1,000.
               </p>
             </section>
           )}
@@ -850,71 +1006,76 @@ export default function Home() {
             </>
           )}
 
-          {topTab === "model" && (
+          {topTab === "btc_trend" && (
             <>
               <section className="card">
-                <h2>Betting Model</h2>
+                <h2>BTC Trend</h2>
                 <p className="section-note">
-                  The self-learning model bets on Kalshi when its own
-                  probability is well above the payout-implied probability
-                  (edge ≥ 3¢ for singles, ≥ 5¢ for combos), sizes with
-                  quarter-Kelly capped at 2% of bankroll, and records every
-                  bet in its outcomes database — it learns from correct and
-                  wrong outcomes. The kill switch stops it if realised model
-                  P&amp;L falls below −2% of bankroll.
+                  Kalshi-only, on the 15-minute Bitcoin up/down market
+                  (KXBTC15M — &ldquo;BTC price up in next 15
+                  mins?&rdquo;). At minute 12 of four windows a day
+                  (ending 10 AM, 1 PM, 4 PM and 8 PM ET) it checks the
+                  Bitcoin move since the window opened: up at least 0.15%
+                  and it buys Yes, down at least 0.15% and it buys No,
+                  anything smaller and it sits out. Each bet is 5% of the
+                  bankroll. The market settles on the CF Benchmarks
+                  Bitcoin rate at the end of the window.
                 </p>
-                <p className="section-note">
-                  Note: model bets are player props, which resolve in the
-                  model&apos;s outcomes database — legs here show as settled
-                  only once the API marks them settled.
-                </p>
-                {modelTrades.length === 0 ? (
+                {btcTrendTrades.length === 0 ? (
                   <p className="empty">
-                    No model bets yet — the model only bets when its edge is
-                    ≥ 3¢ (singles) / ≥ 5¢ (combos). It is live and checking
-                    every minute.
+                    No BTC Trend bets yet — the bot only bets when the
+                    trend is clear at the 12-minute mark. It checks four
+                    windows a day.
                   </p>
                 ) : (
-                  <div className="best-grid">
-                    <div>
-                      <span className="kv-label">Model bets placed</span>
-                      <span className="kv-value">{modelTrades.length}</span>
-                    </div>
-                    <div>
-                      <span className="kv-label">Total outlay</span>
-                      <span className="kv-value">{fmtUsd(modelOutlay)}</span>
-                    </div>
-                    <div>
-                      <span className="kv-label">Realised P&amp;L</span>
-                      <span
-                        className={`kv-value ${modelRealised >= 0 ? "txt-pos" : "txt-neg"}`}
-                      >
-                        {fmtSignedUsd(modelRealised)}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="kv-label">Win rate (settled legs)</span>
-                      <span className="kv-value">
-                        {modelWinRate === null
-                          ? "—"
-                          : `${modelWonLegs.length}/${modelSettledLegs.length} (${modelWinRate.toFixed(0)}%)`}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="kv-label">Open positions</span>
-                      <span className="kv-value">{modelOpenLegs.length}</span>
-                    </div>
-                  </div>
+                  <RunStats trades={btcTrendTrades} />
                 )}
               </section>
 
-              {modelTrades.length > 0 && (
+              {btcTrendTrades.length > 0 && (
                 <>
-                  <PositionsSection trades={modelTrades} />
+                  <PositionsSection trades={btcTrendTrades} />
                   <TradesTable
-                    trades={modelTrades}
+                    trades={btcTrendTrades}
                     showDedupNote={false}
-                    note="A model bet wins when the event it bet on happens; a losing leg is the outlay on a leg that paid $0."
+                    note="Kalshi-only — one leg per bet, Yes when Bitcoin was trending up at minute 12, No when it was trending down."
+                  />
+                </>
+              )}
+            </>
+          )}
+
+          {topTab === "btc_timing" && (
+            <>
+              <section className="card">
+                <h2>BTC Timing</h2>
+                <p className="section-note">
+                  Kalshi-only, on the same 15-minute Bitcoin up/down
+                  market as BTC Trend — but instead of always betting at
+                  minute 12, this model tries different entry minutes
+                  (3, 6, 9, 12, 14) and learns which one pays best. Early
+                  entry means a better price but more time for the trend
+                  to flip; late entry means a worse price but the outcome
+                  is nearly certain. Each bet is 5% of the bankroll.
+                </p>
+                {btcTimingTrades.length === 0 ? (
+                  <p className="empty">
+                    No BTC Timing bets yet — the model is still learning.
+                  </p>
+                ) : (
+                  <RunStats trades={btcTimingTrades} />
+                )}
+              </section>
+
+              <TimingLearningSection learning={data?.timing_learning} />
+
+              {btcTimingTrades.length > 0 && (
+                <>
+                  <PositionsSection trades={btcTimingTrades} />
+                  <TradesTable
+                    trades={btcTimingTrades}
+                    showDedupNote={false}
+                    note="Kalshi-only — one leg per bet. The entry minute is in the trade label."
                   />
                 </>
               )}
@@ -924,8 +1085,9 @@ export default function Home() {
           <footer className="footer">
             <span>
               Read-only dashboard for the paper trader (fake money, 2-week
-              run). It never places trades. Two runs share one cash pool:
-              cross-venue arbitrage and the self-learning betting model.
+              run). It never places trades. Three runs with separate
+              bankrolls: cross-venue arbitrage, BTC 15-minute trend, and
+              the BTC timing model.
             </span>
             <span>
               API: <code>{apiUrl}</code>

@@ -50,7 +50,9 @@ export interface Trade {
   timestamp: string;
   label: string;
   status: string;
-  /** "arb" (cross-venue arbitrage) or "model" (self-learning betting model). */
+  /** "arb" (cross-venue arbitrage), "btc_trend" (fixed 12-minute
+      Bitcoin trend bet) or "btc_timing" (timing model learning the best
+      minute to bet). */
   source?: string;
   cost_cents: number;
   contracts: number;
@@ -97,20 +99,42 @@ export interface SeriesPoint {
   polymarket: number;
 }
 
+export interface TimingLearningMinute {
+  entry_minute: number;
+  bets: number;
+  wins: number;
+  win_rate: number;
+  total_pnl: number;
+  avg_pnl: number;
+}
+
+export interface TimingLearning {
+  best_minute: number | null;
+  minutes: TimingLearningMinute[];
+}
+
 export interface DashboardData {
   portfolio: Portfolio;
-  /** v4.5: the betting model's OWN bankroll, separate from the arb
-      pool. Absent when the deployed dashboard predates v4.5. */
-  model_portfolio?: Portfolio;
+  /** BTC Trend run's OWN bankroll ($1,000 start), separate from the
+      arb pool. Absent when the deployed dashboard predates it. */
+  btc_trend_portfolio?: Portfolio;
+  /** BTC Timing run's OWN bankroll ($1,000 start), separate from the
+      arb pool. Absent when the deployed dashboard predates it. */
+  btc_timing_portfolio?: Portfolio;
+  /** What the timing model has learned so far, by entry minute.
+      Absent when the deployed dashboard predates it. */
+  timing_learning?: TimingLearning;
   trades: Trade[];
   signals: Signal[];
   best_signal: Signal | null;
   watchlist: WatchlistItem[];
   series: {
     portfolio_value: SeriesPoint[];
-    /** v4.5: model pool's portfolio-value series. */
-    model_portfolio_value?: SeriesPoint[];
-    best_edge?: { ts: string; edge_c: number }[];
+    /** BTC Trend pool's portfolio-value series. */
+    btc_trend_portfolio_value?: SeriesPoint[];
+    /** BTC Timing pool's portfolio-value series. */
+    btc_timing_portfolio_value?: SeriesPoint[];
+    best_edge?: { ts: string; edge: number }[];
     candidates?: { ts: string; count: number }[];
   };
   meta?: {

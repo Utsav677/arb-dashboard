@@ -469,6 +469,12 @@ tbody tr:last-child td {
   border-bottom: none;
 }
 
+/* Best entry minute in the timing model's learning table. */
+tr.row-best td {
+  background: var(--green-bg);
+  font-weight: 600;
+}
+
 .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -512,7 +518,7 @@ tbody tr:last-child td {
 /* ---------- top-level run tabs ---------- */
 .top-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 8px;
   margin: 16px 0 4px;
 }
