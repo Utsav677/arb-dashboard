@@ -568,6 +568,13 @@ function TimingLearningSection({
   );
   const totalBets = minutes.reduce((s, m) => s + (m.bets ?? 0), 0);
   const bestMinute = learning?.best_minute ?? null;
+  // Hours with at least one bet, in hour order. The `hours` array is
+  // absent on dashboards that predate v4.7 — the table degrades to its
+  // empty state instead of crashing.
+  const hours = [...(learning?.hours ?? [])]
+    .filter((h) => (h.bets ?? 0) > 0)
+    .sort((a, b) => a.hour - b.hour);
+  const bestHour = learning?.best_hour ?? null;
 
   return (
     <section className="card">
@@ -579,7 +586,10 @@ function TimingLearningSection({
         — and bets mostly at the best minute so far, while still trying
         other minutes about 20% of the time so it keeps learning. It
         doesn&apos;t have to win every bet; it has to find the minute
-        that pays best over time.
+        that pays best over time. It also records the hour of day (ET)
+        each bet was placed in, so it can learn which hours pay best —
+        and it sits out exploit bets in hours that have been losing
+        money.
       </p>
       {totalBets === 0 ? (
         <p className="empty">
@@ -644,6 +654,70 @@ function TimingLearningSection({
               </tbody>
             </table>
           </div>
+
+          <h3>By hour of day (ET)</h3>
+          {bestHour !== null && (
+            <p className="section-note">
+              Best hour so far: <strong>hour {bestHour} ET</strong> —
+              the model prefers betting in hours that have paid best.
+            </p>
+          )}
+          {hours.length === 0 ? (
+            <p className="empty">
+              No bets yet — the model is still learning.
+            </p>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Hour (ET)</th>
+                    <th className="num">Bets</th>
+                    <th className="num">Wins</th>
+                    <th className="num">Win rate</th>
+                    <th className="num">Avg P&amp;L / bet</th>
+                    <th className="num">Total P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {hours.map((h) => {
+                    const isBest =
+                      bestHour !== null && h.hour === bestHour;
+                    return (
+                      <tr
+                        key={h.hour}
+                        className={isBest ? "row-best" : undefined}
+                      >
+                        <td>
+                          Hour {h.hour}
+                          {isBest && (
+                            <span className="badge badge-settled"> best</span>
+                          )}
+                        </td>
+                        <td className="num">{h.bets}</td>
+                        <td className="num">{h.wins}</td>
+                        <td className="num">
+                          {h.bets > 0
+                            ? `${(((h.win_rate ?? 0) > 1 ? (h.win_rate ?? 0) : (h.win_rate ?? 0) * 100)).toFixed(0)}%`
+                            : "—"}
+                        </td>
+                        <td
+                          className={`num ${(h.avg_pnl ?? 0) >= 0 ? "txt-pos" : "txt-neg"}`}
+                        >
+                          {h.bets > 0 ? fmtSignedUsd(h.avg_pnl) : "—"}
+                        </td>
+                        <td
+                          className={`num ${(h.total_pnl ?? 0) >= 0 ? "txt-pos" : "txt-neg"}`}
+                        >
+                          {h.bets > 0 ? fmtSignedUsd(h.total_pnl) : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </>
       )}
     </section>

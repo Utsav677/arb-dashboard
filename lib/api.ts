@@ -108,9 +108,23 @@ export interface TimingLearningMinute {
   avg_pnl: number;
 }
 
+export interface TimingLearningHour {
+  hour: number;
+  bets: number;
+  wins: number;
+  win_rate: number;
+  total_pnl: number;
+  avg_pnl: number;
+}
+
 export interface TimingLearning {
   best_minute: number | null;
   minutes: TimingLearningMinute[];
+  /** Per-hour-of-day (ET) record. Absent when the deployed dashboard
+      predates v4.7. */
+  hours?: TimingLearningHour[];
+  /** Hour (ET) with the highest avg P&L, null with no settled bets. */
+  best_hour?: number | null;
 }
 
 export interface DashboardData {
